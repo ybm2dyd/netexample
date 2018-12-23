@@ -24,18 +24,23 @@ public:
 		return header_length + body_length_;
 	}
 
-	const char* body() const
+	std::size_t body_length() const
+	{
+		return body_length_;
+	}
+
+	char* body()
 	{
 		return data_ + header_length;
 	}
 
-	bool decode_header()
+	void decode_header()
 	{
 		memcpy(&body_length_, data_, header_length);
 		body_length_ = boost::asio::detail::socket_ops::network_to_host_short(body_length_);
 	}
 
-	bool encode_header()
+	void encode_header()
 	{
 		unsigned short hs = boost::asio::detail::socket_ops::host_to_network_short(body_length_);
 		memcpy(data_, &hs, header_length);
@@ -69,6 +74,7 @@ public:
 		: socket_(std::move(socket)), room_(room)
 	{
 		room_.join(shared_from_this());
+		do_read_header();
 	}
 
 	void deliver(const chat_message& msg)
@@ -80,12 +86,36 @@ public:
 private:
 	void do_read_header()
 	{
-
+		auto p = shared_from_this();
+		boost::asio::async_read(socket_, boost::asio::buffer(read_msg_.data(), chat_message::header_length),
+			[this, p](boost::system::error_code ec, std::size_t len) {
+			if (ec)
+			{
+				room_.leave(p);
+			}
+			else
+			{
+				read_msg_.decode_header();
+				do_read_body();
+			}
+		});
 	}
 	
 	void do_read_body()
 	{
-
+		auto p = shared_from_this();
+		boost::asio::async_read(socket_, boost::asio::buffer(read_msg_.body(), read_msg_.body_length()),
+			[p, this](boost::system::error_code ec, std::size_t len) {
+			if (ec)
+			{
+				room_.leave(p);
+			}
+			else
+			{
+				room_.deliver(read_msg_);
+				do_read_body();
+			}
+		});
 	}
 
 	void do_write()
@@ -159,18 +189,9 @@ int main(int argc, char* argv[])
 {
 	try
 	{
-		if (argc < 2)
-		{
-			std::cerr << "Usage: chat_server <port> [<port> ...]\n";
-			return 1;
-		}
 		boost::asio::io_context io_context;
-		std::list<chat_server> servers;
-		for (int i = 1; i < argc; ++i)
-		{
-			boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::tcp::v4(), std::atoi(argv[i]));
-			servers.emplace_back(io_context, endpoint);
-		}
+		boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::tcp::v4(), 8001);
+		chat_server server(io_context, endpoint);
 		io_context.run();
 
 	}
