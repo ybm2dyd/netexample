@@ -11,8 +11,8 @@ class chat_message
 {
 public:
 	// big edian
-	enum { header_length = 2};
-	enum {max_body_length = 65535};
+	enum { header_length = 2 };
+	enum { max_body_length = 65535 };
 
 	char* data()
 	{
@@ -60,7 +60,7 @@ public:
 	void join(std::shared_ptr<chat_session> session);
 	void leave(std::shared_ptr<chat_session> session);
 	void deliver(const chat_message& msg);
-	
+
 private:
 	std::set<std::shared_ptr<chat_session>> sessions_;
 	std::deque<chat_message> recent_msgs_;
@@ -73,14 +73,23 @@ public:
 	chat_session(boost::asio::ip::tcp::socket socket, chat_room& room)
 		: socket_(std::move(socket)), room_(room)
 	{
+		
+	}
+
+	void start()
+	{
 		room_.join(shared_from_this());
 		do_read_header();
 	}
 
 	void deliver(const chat_message& msg)
 	{
+		bool write_in_progess = !write_msgs_.empty();
 		write_msgs_.push_back(msg);
-		do_write();
+		if (!write_in_progess)
+		{
+			do_write();
+		}
 	}
 
 private:
@@ -100,7 +109,7 @@ private:
 			}
 		});
 	}
-	
+
 	void do_read_body()
 	{
 		auto p = shared_from_this();
@@ -113,13 +122,29 @@ private:
 			else
 			{
 				room_.deliver(read_msg_);
-				do_read_body();
+				do_read_header();
 			}
 		});
 	}
 
 	void do_write()
 	{
+		auto p = shared_from_this();
+		boost::asio::async_write(socket_, boost::asio::buffer(write_msgs_.front().data(), write_msgs_.front().length()),
+			[p, this](boost::system::error_code ec, std::size_t len) {
+			if (!ec)
+			{
+				write_msgs_.pop_front();
+				if (!write_msgs_.empty())
+				{
+					do_write();
+				}
+			}
+			else
+			{
+				room_.leave(p);
+			}
+		});
 
 	}
 
@@ -148,6 +173,7 @@ public:
 				std::cout << ec.message() << std::endl;
 			}
 			auto p = std::make_shared<chat_session>(std::move(socket), room_);
+			p->start();
 
 			do_accept();
 			; });
