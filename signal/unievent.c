@@ -245,11 +245,11 @@ int main(int argc, char*argv)
 		case SOCKET_TYPE_CONNECT:
 			if (e->read)
 			{
-
+				--event_index;
 			}
 			if (e->write)
 			{
-
+				--event_index;
 			}
 			break;
 	}
