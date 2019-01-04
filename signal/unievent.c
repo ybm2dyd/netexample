@@ -13,6 +13,7 @@
 #include <sys/epoll.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <sys/select.h>
 
 #include "socket_poll.h"
 
@@ -24,7 +25,7 @@
 static int pipe_fd[2];
 
 struct event ev[MAX_EVENT];
-static int checkctrl = 0;
+// static int checkctrl = 1;
 static fd_set rfds;
 static int event_index = 0;
 static int event_number = 0;
@@ -37,26 +38,23 @@ struct socket
 
 static void sig_handler(int sig)
 {
+	fprintf(stderr, "sig:%d\n", sig);
+
+	int save_errno = errno;
+	int msg = sig;
 	send(pipe_fd[1], (char*)&msg, 1, 0);
-	for (;;) {
-		int n = write(pipe_fd[1], &sig, 1);
-		if (n < 0) {
-			if (errno != EINTR) {
-				fprintf(stderr, "socket-server : send ctrl command error %s.\n", strerror(errno));
-			}
-			continue;
-		}
-		return;
-	}
+	errno = save_errno;
+
 }
 
 void addsig(int sig)
 {
 	struct sigaction sa;
-	memset(&sa, 0, sizeof(sa));
+	memset(&sa, '\0', sizeof(sa));
 	sa.sa_handler = sig_handler;
-	sa.sa_flags = SA_RESTART;
+	sa.sa_flags |= SA_RESTART;
 	sigfillset(&sa.sa_mask);
+	assert(sigaction(sig, &sa, NULL) != -1);
 
 }
 
@@ -108,6 +106,13 @@ _failed_fd:
 	return -1;
 }
 
+static void
+socket_keepalive(int fd)
+{
+	int keepalive = 1;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive, sizeof(keepalive));
+}
+
 static int has_sig()
 {
 	struct timeval tv = { 0,0 };
@@ -139,11 +144,10 @@ block_readpipe(int pipefd, void *buffer, int sz)
 	}
 }
 
-int main(int argc, char*argv)
+int main(int argc, char*argv[])
 {
 	if (argc <= 2)
 	{
-		printf("usage: %s ip_address port_number\n", basename(argv[0]));
 		return 1;
 	}
 	const char* host = argv[1];
@@ -167,7 +171,9 @@ int main(int argc, char*argv)
 		fprintf(stderr, "socket-server: can't add server fd to event pool.\n");
 		return 0;
 	}
-	FD_ZERO(rfds);
+	sp_nonblocking(pipe_fd[0]);
+	sp_nonblocking(pipe_fd[1]);
+	FD_ZERO(&rfds);
 
 	int listen_fd = do_listen(host, port, 32);
 	if (listen_fd < 0)
@@ -185,76 +191,152 @@ int main(int argc, char*argv)
 	addsig(SIGCHLD);
 	addsig(SIGTERM);
 	addsig(SIGINT);
-	bool stop_server = false;
 
-	// poll
 	for (;;)
 	{
-		if (checkctrl)
+		event_number = sp_wait(efd, ev, MAX_EVENT);
+		if (event_number < 0 && errno != EINTR)
 		{
-			if (has_sig())
+			fprintf(stderr, "epoll error\n");
+			goto _exit_server;
+		}
+		event_index = 0;
+		for (; event_index < event_number; event_index++)
+		{
+			struct event* e = &ev[event_index];
+			struct socket* s = e->s;
+			if (s == NULL)
 			{
-				char signal;
-				block_readpipe(fd, &signal, 1);
-				switch (signal)
-				{
-				case SIGCHLD:
-				case SIGHUP:
+				fprintf(stderr, "pipe signal\n");
+				char signals[1024];
+				int ret = recv(pipe_fd[0], signals, sizeof(signals), 0);
+				if (ret <= 0)
 				{
 					continue;
 				}
-				case SIGTERM:
-				case SIGINT:
+				else
 				{
-					goto _exit_server;
+					int i;
+					for (i = 0; i < ret; ++i)
+					{
+						switch (signals[i])
+						{
+						case SIGCHLD:
+						case SIGHUP:
+						{
+							continue;
+						}
+						case SIGTERM:
+						case SIGINT:
+						{
+							fprintf(stderr, "socket-server: INT exit\n");
+							goto _exit_server;
+						}
+						}
+					}
 				}
+				if (has_sig())
+				{
+				
 				}
+				continue;
 			}
-			else
+			switch (s->type)
 			{
-				checkctrl = 0;
-			}
-		}
-		if (event_index == event_number)
-		{
-			event_number = sp_wait(efd, ev, MAX_EVENT);
-			checkctrl = 1;
-			event_index = 0;
-		}
-		struct event* e = ev[event_index++];
-		struct socket* s = e->s;
-		if (s == NULL)
-		{
-			// dispatch sig
-			continue;
-		}
-		switch (s->type)
-		{
-		case SOCKET_TYPE_LISTEN:
-			struct sockaddr_in client_address;
-			socklen_t client_addrlength = sizeof(client_address);
-			int client_fd = accept(listenfd, (struct sockaddr*)&client_address, &client_addrlength);
-			socket_keepalive(client_fd);
-			sp_nonblocking(client_fd);
-			struct socket s;
-			s.fd = client_fd;
-			s.type = SOCKET_TYPE_CONNECT;
-			sp_add(efd, client_fd);
-			break;
-		}
-		case SOCKET_TYPE_CONNECT:
-			if (e->read)
+			case SOCKET_TYPE_LISTEN:
 			{
-				--event_index;
+				struct sockaddr_in client_address;
+				socklen_t client_addrlength = sizeof(client_address);
+				int client_fd = accept(s->fd, (struct sockaddr*)&client_address, &client_addrlength);
+				socket_keepalive(client_fd);
+				sp_nonblocking(client_fd);
+				struct socket cs;
+				cs.fd = client_fd;
+				cs.type = SOCKET_TYPE_CONNECT;
+				sp_add(efd, client_fd, &cs);
+				break;
 			}
-			if (e->write)
-			{
-				--event_index;
+
 			}
-			break;
+		} 
 	}
 
-_exit_server:
+	//// poll
+	//for (;;)
+	//{
+	//	if (checkctrl)
+	//	{
+	//		if (has_sig())
+	//		{
+	//			char signal;
+	//			block_readpipe(pipe_fd[0], &signal, 1);
+	//			switch (signal)
+	//			{
+	//			case SIGCHLD:
+	//			case SIGHUP:
+	//			{
+	//				continue;
+	//			}
+	//			case SIGTERM:
+	//			case SIGINT:
+	//			{
+	//				fprintf(stderr, "socket-server: INT exit\n");
+	//				goto _exit_server;
+	//			}
+	//			}
+	//		}
+	//		else
+	//		{
+	//			checkctrl = 0;
+	//		}
+	//	}
+	//	if (event_index == event_number)
+	//	{
+	//		event_number = sp_wait(efd, ev, MAX_EVENT);
+	//		if (event_number <= 0)
+	//		{
+	//			fprintf(stderr, "epoll failure\n");
+	//			goto _exit_server;
+	//		}
+	//		checkctrl = 1;
+	//		event_index = 0;
+	//	}
+	//	struct event* e = &ev[event_index++];
+	//	struct socket* s = e->s;
+	//	if (s == NULL)
+	//	{
+	//		// dispatch sig
+	//		continue;
+	//	}
+	//	switch (s->type)
+	//	{
+	//	case SOCKET_TYPE_LISTEN:
+	//	{
+	//		struct sockaddr_in client_address;
+	//		socklen_t client_addrlength = sizeof(client_address);
+	//		int client_fd = accept(s->fd, (struct sockaddr*)&client_address, &client_addrlength);
+	//		socket_keepalive(client_fd);
+	//		sp_nonblocking(client_fd);
+	//		struct socket cs;
+	//		cs.fd = client_fd;
+	//		cs.type = SOCKET_TYPE_CONNECT;
+	//		sp_add(efd, client_fd, &cs);
+	//		break;
+	//	}
+	//	case SOCKET_TYPE_CONNECT:
+	//		if (e->read)
+	//		{
+
+	//		}
+	//		if (e->write)
+	//		{
+
+	//		}
+	//		break;
+	//	}
+	//}
+
+_exit_server:;
 _failed_listen:
 	close(listen_fd);
 _failed_add:
